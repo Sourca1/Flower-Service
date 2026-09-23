@@ -1,3 +1,5 @@
+-- Dependencies used by the NPC for lifecycle management, pathfinding, combat,
+-- cooldowns, distance checks, animation loading, and ragdoll behavior.
 local Knit = require(game.ReplicatedStorage.Packages.Knit.Knit)
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
@@ -16,12 +18,16 @@ local FlowersService = Knit.CreateService{
 	Client = {}
 }
 
+-- Central tuning values for the NPC. Chase speed is expressed as a multiplier so
+-- temporary effects can be composed through the same movement modifier system.
 FlowersService.Settings = {
 	ChaseDistance = 100,
 	BaseWalkSpeed = 35,
 	ChaseMultiplier = 1.7, -- 35 * 1.7 = ~60 when chasing
 }
---global vars for every function to use
+
+-- Runtime state for the single Flowers NPC managed by this service. These
+-- references are initialized in KnitStart and reused by the AI and attack logic.
 local Debug = false
 local CurrentState = "WANDER"
 local currentTarget = nil
@@ -31,31 +37,34 @@ local Humanoid = nil
 local path = nil
 local PunchAnimation = nil
 local GrabAnimation = nil
-local StunnedAnimation:AnimationTrack = nil
+local StunnedAnimation: AnimationTrack = nil
 local grabDuration = 0.5
 local pullSpeed = 100
 
+-- A chase path is only recomputed after the target has moved far enough from the
+-- last requested destination. This avoids rebuilding a path every AI update.
 local RECOMPUTE_DISTANCE = 6
 local lastTargetPosition = nil
 local flowersSpeedFolder = nil
 
--- gets the SpeedFolder under Flowers model and * by every numbervalue and Flowers base speed
+-- Calculates the NPC's final speed by multiplying every active modifier together.
+-- A value of 1 is neutral, values above 1 increase speed, and 0 fully stops movement.
+-- This allows independent effects such as Chase, Stun, and GrabSlow to coexist.
 local function getFlowersSpeed()
 	if not flowersSpeedFolder then return FlowersService.Settings.BaseWalkSpeed end
+
 	local total = 1
 	for _, value in pairs(flowersSpeedFolder:GetChildren()) do
 		if value:IsA("NumberValue") then
 			total *= value.Value
 		end
 	end
+
 	return FlowersService.Settings.BaseWalkSpeed * total
 end
 
-
---[[
-Set up speed folder
-sets up speed folder for future use 
-]]
+-- Creates the modifier container if it does not already exist and keeps
+-- Humanoid.WalkSpeed synchronized whenever modifiers are added, removed, or changed.
 local function setupSpeedFolder()
 	flowersSpeedFolder = flowers:FindFirstChild("SpeedMultipliers")
 	if not flowersSpeedFolder then
@@ -64,7 +73,8 @@ local function setupSpeedFolder()
 		flowersSpeedFolder.Parent = flowers
 	end
 
-	-- watch for changes and update walkspeed
+	-- A modifier may be tweened after it is inserted, so changes to its value also
+	-- trigger a complete speed recalculation rather than only reacting to insertion.
 	flowersSpeedFolder.ChildAdded:Connect(function(child)
 		if child:IsA("NumberValue") then
 			child.Changed:Connect(function()
@@ -78,10 +88,10 @@ local function setupSpeedFolder()
 		Humanoid.WalkSpeed = getFlowersSpeed()
 	end)
 end
---[[
-Add Multiplier
-Adds a Speed multiplier to the speed folder 
-]]
+
+-- Adds or updates a named movement modifier. Naming modifiers prevents duplicate
+-- effects from stacking accidentally, while duration allows temporary effects to
+-- remove themselves through the same RemoveMultiplier path.
 function FlowersService:AddMultiplier(name: string, value: number, duration: number?, tweenTime: number?)
 	if not flowersSpeedFolder then return end
 	local TweenService = game:GetService("TweenService")
@@ -107,10 +117,8 @@ function FlowersService:AddMultiplier(name: string, value: number, duration: num
 	end
 end
 
---[[
-Remove Multiplier
-Removes the named Speed multiplier
-]]
+-- Removes a movement modifier. When tweening is requested, the modifier first
+-- returns to the neutral value of 1 so movement transitions smoothly before cleanup.
 function FlowersService:RemoveMultiplier(name: string, tweenTime: number?)
 	if not flowersSpeedFolder then return end
 	local TweenService = game:GetService("TweenService")
@@ -126,12 +134,11 @@ function FlowersService:RemoveMultiplier(name: string, tweenTime: number?)
 		value:Destroy()
 	end
 end
---[[
-Get Nearest Player
-Gets the nearest player if there isnt a TargetOverride
-]]
+
+-- Finds the active target for the NPC. A TargetOverride takes priority over normal
+-- nearest-player selection so another system can temporarily force Flowers to focus
+-- a specific player, such as the player responsible for stunning it.
 function FlowersService:GetNearestPlayer(root)
-	-- check for target override first
 	local overrideName = flowers and flowers:GetAttribute("TargetOverride")
 	if overrideName then
 		local overridePlayer = Players:FindFirstChild(overrideName)
@@ -141,7 +148,8 @@ function FlowersService:GetNearestPlayer(root)
 				return overridePlayer, Util.Distance(root.Position, hrp.Position)
 			end
 		end
-		-- player left or died, clear override
+
+		-- Invalid overrides are cleared so normal nearest-player targeting can resume.
 		flowers:SetAttribute("TargetOverride", nil)
 	end
 
@@ -157,24 +165,24 @@ function FlowersService:GetNearestPlayer(root)
 			nearestDistance = distance
 		end
 	end
+
 	return nearestPlayer, nearestDistance
 end
 
---[[
-Stun
-Disables Flowers movement and Abilities and makes flowers chase the stunner for
-10 seconds
-]]
+-- Temporarily disables movement and both attacks. Once the stun expires, the NPC
+-- can retaliate against the stunner by forcing a temporary target override and
+-- immediately resuming chase behavior toward that player.
 function FlowersService:Stun(duration: number, stunnerPlayer: Player?)
 	if flowers:GetAttribute("Stunned") then return end
 
 	flowers:SetAttribute("Stunned", true)
-     StunnedAnimation.Looped = true
-     StunnedAnimation:Play(0.125)
+	StunnedAnimation.Looped = true
+	StunnedAnimation:Play(0.125)
 	self:AddMultiplier("Stun", 0, nil, 0.1)
 	path:Stop()
 
-
+	-- Extending both attack cooldowns prevents an attack sequence from starting while
+	-- the NPC is immobilized, keeping movement and combat state consistent.
 	Cooldowns:Start(flowers, "Punch", duration)
 	Cooldowns:Start(flowers, "Grab", duration)
 
@@ -183,7 +191,6 @@ function FlowersService:Stun(duration: number, stunnerPlayer: Player?)
 		flowers:SetAttribute("Stunned", false)
 		self:RemoveMultiplier("Stun", 0.2)
 		StunnedAnimation:Stop(0.125)
-
 
 		if stunnerPlayer and stunnerPlayer.Character then
 			local hrp = stunnerPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -201,7 +208,7 @@ function FlowersService:Stun(duration: number, stunnerPlayer: Player?)
 	end)
 end
 
---help functions to get points on the map
+-- Map helpers used by the wandering behavior to choose random spawn/path locations.
 function FlowersService:RandomSpawn()
 	local spawns = SpawnPoints:GetChildren()
 	return spawns[math.random(1, #spawns)]
@@ -211,22 +218,24 @@ function FlowersService:RandomPathPoint()
 	local points = PathPoints:GetChildren()
 	return points[math.random(1, #points)]
 end
---[[
-Grab Attack
-Returns if the player is to far or if the Cooldown is currently going on
-Makes the Punch and Grab attack go on cooldown
-We wait 0.25 because of the startup
-]]
+
+-- Attempts the ranged grab when the target is inside its intended distance band and
+-- the ability is available. Punch is briefly locked as well so both attacks cannot
+-- overlap while the grab startup and pull sequence are running.
 function FlowersService:TryGrab()
 	local player, distance = FlowersService:GetNearestPlayer(root)
 	if distance < 15 or distance > 50 then return end
 	if not Cooldowns:CanUse(flowers, "Grab") then return end
+
 	Cooldowns:Start(flowers, "Grab", 8)
 	Cooldowns:Start(flowers, "Punch", 1.5)
 	self:AddMultiplier("GrabSlow", 0, nil, 0.1)
 	GrabAnimation:Play(0.125)
+
+	-- The startup delay gives the animation time to telegraph the grab before its
+	-- hitbox becomes active.
 	task.wait(0.25)
-         Humanoid.AutoRotate = false
+	Humanoid.AutoRotate = false
 	Hitboxes:CreateHitbox(flowers, {
 		Size = Vector3.new(6, 13, 70),
 		CFrameOffset = CFrame.new(0, -1, -20),
@@ -244,9 +253,11 @@ function FlowersService:TryGrab()
 				local targetRoot = target:FindFirstChild("HumanoidRootPart")
 				local targetHumanoid = target:FindFirstChildOfClass("Humanoid")
 				if not targetRoot or not targetHumanoid then return end
-                 
-				Ragdoll:Ragdoll(target,1.5)
 
+				Ragdoll:Ragdoll(target, 1.5)
+
+				-- Repeated short-lived velocity constraints continually redirect the target
+				-- toward Flowers during the pull window, then damage is applied at the end.
 				task.spawn(function()
 					local startTime = tick()
 					while tick() - startTime < grabDuration do
@@ -268,23 +279,20 @@ function FlowersService:TryGrab()
 					if targetHumanoid and targetHumanoid.Health > 0 then
 						targetHumanoid:TakeDamage(15)
 					end
-					
 				end)
 			end,
 		}
 	})
 
-	-- restore speed after grab
+	-- Restore normal movement/rotation after the grab's active sequence finishes.
 	task.delay(0.6, function()
 		self:RemoveMultiplier("GrabSlow", 0.2)
 		Humanoid.AutoRotate = true
 	end)
 end
 
---[[
-Try Attack
-Tries to use both attacks if they are far or near a player
-]]
+-- Chooses between the close-range punch and the grab based on target distance.
+-- The individual attack functions remain responsible for their own cooldown checks.
 function FlowersService:TryAttack()
 	local player, distance = FlowersService:GetNearestPlayer(root)
 
@@ -311,26 +319,25 @@ function FlowersService:TryAttack()
 	end
 end
 
-
---[[
-Brain of flowers
-This is the brain of flowers all vars are assigned in here
-Pathfinding is start in here and the Main while true loop is ran inside of here.
-]]
+-- Initializes the NPC and owns its main AI lifecycle. The outer loop watches the
+-- day/night cycle, while the inner loop performs lower-frequency AI decisions only
+-- while Flowers is active at night.
 function FlowersService:KnitStart()
 	flowers = ReplicatedStorage:WaitForChild("Flowers")
 	root = flowers and flowers.PrimaryPart
 	path = flowers and SimplePath.new(flowers)
 	Humanoid = flowers and flowers:FindFirstChild("Humanoid")
 	PunchAnimation = Util.LoadAnimation(Humanoid, "119528894450443", Enum.AnimationPriority.Action)
-	GrabAnimation = Util.LoadAnimation(Humanoid,"72069414099158",Enum.AnimationPriority.Action2)
-	StunnedAnimation = Util.LoadAnimation(Humanoid,"86989799335770",Enum.AnimationPriority.Action4)
+	GrabAnimation = Util.LoadAnimation(Humanoid, "72069414099158", Enum.AnimationPriority.Action2)
+	StunnedAnimation = Util.LoadAnimation(Humanoid, "86989799335770", Enum.AnimationPriority.Action4)
 	setupSpeedFolder()
 	Humanoid.WalkSpeed = FlowersService.Settings.BaseWalkSpeed
 
 	local TimeCycle = Knit.GetService("TimeCycle")
 	local aiRunning = false
 
+	-- Reaching a wander point immediately selects another point so roaming can
+	-- continue without waiting for the main decision loop to notice completion.
 	path.Reached:Connect(function()
 		if CurrentState == "WANDER" then
 			currentTarget = FlowersService:RandomPathPoint()
@@ -350,22 +357,24 @@ function FlowersService:KnitStart()
 				flowers.Parent = workspace
 				path.Visualize = Debug
 
+				-- AI decisions run at a lower frequency than the day/night watcher. This is
+				-- sufficient for target/state decisions without recomputing them every frame.
 				task.spawn(function()
 					while aiRunning do
 						task.wait(0.25)
 
 						local player, distance = FlowersService:GetNearestPlayer(root)
 
+						-- Enter chase when a player is inside the configured aggro range. Speed
+						-- changes are only applied on state transitions rather than every update.
 						if player and distance < FlowersService.Settings.ChaseDistance then
 							if CurrentState ~= "CHASE" then
 								lastTargetPosition = nil
-								-- tween into chase speed
 								self:AddMultiplier("Chase", FlowersService.Settings.ChaseMultiplier, nil, 0.5)
 							end
 							CurrentState = "CHASE"
 						else
 							if CurrentState == "CHASE" then
-								-- tween back to walk speed
 								self:RemoveMultiplier("Chase", 0.5)
 							end
 							CurrentState = "WANDER"
@@ -376,6 +385,8 @@ function FlowersService:KnitStart()
 							local character = player and player.Character
 							local hrp = character and character:FindFirstChild("HumanoidRootPart")
 							if hrp then
+								-- Pathfinding is only requested again after enough target movement to
+								-- justify a new destination, reducing unnecessary path computations.
 								if not lastTargetPosition or (hrp.Position - lastTargetPosition).Magnitude > RECOMPUTE_DISTANCE then
 									lastTargetPosition = hrp.Position
 									path:Run(hrp.Position)
@@ -390,6 +401,9 @@ function FlowersService:KnitStart()
 									path:Run(currentTarget.Position)
 								end
 							end
+
+							-- The distance check is a fallback for cases where the path library's
+							-- reached event is not enough to advance roaming on its own.
 							if currentTarget then
 								local dist = (root.Position - currentTarget.Position).Magnitude
 								if dist < 6 then
@@ -402,6 +416,8 @@ function FlowersService:KnitStart()
 				end)
 
 			elseif cycle == "Day" and aiRunning then
+				-- Deactivating the NPC resets transient chase state before moving the model
+				-- back into ReplicatedStorage, ready for the next night cycle.
 				aiRunning = false
 				flowers.Parent = ReplicatedStorage
 				currentTarget = nil
