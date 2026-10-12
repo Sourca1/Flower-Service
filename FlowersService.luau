@@ -1,3 +1,4 @@
+-- Connected Discord-GitHub
 -- Dependencies used by the NPC for lifecycle management, pathfinding, combat,
 -- cooldowns, distance checks, animation loading, and ragdoll behavior.
 local Knit = require(game.ReplicatedStorage.Packages.Knit.Knit)
