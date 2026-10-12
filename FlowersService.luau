@@ -319,111 +319,105 @@ function FlowersService:TryAttack()
 	end
 end
 
+
+local function enterChase()
+	if CurrentState == "CHASE" then return end
+
+	CurrentState = "CHASE"
+	lastTargetPosition = nil
+	FlowersService:AddMultiplier("Chase", FlowersService.Settings.ChaseMultiplier, nil, 0.5)
+end
+
+local function enterWander()
+	if CurrentState == "WANDER" then return end
+
+	CurrentState = "WANDER"
+	lastTargetPosition = nil
+	FlowersService:RemoveMultiplier("Chase", 0.5)
+end
+
+local function updateChase(player: Player?)
+	if not player then return end
+
+	local character = player.Character
+	if not character then return end
+
+	local targetRoot = character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+
+	currentTarget = nil
+
+	if not lastTargetPosition or (targetRoot.Position - lastTargetPosition).Magnitude > RECOMPUTE_DISTANCE then
+		lastTargetPosition = targetRoot.Position
+		path:Run(targetRoot.Position)
+	end
+
+	FlowersService:TryAttack()
+end
+
+local function updateWander()
+	if not currentTarget then
+		currentTarget = FlowersService:RandomPathPoint()
+	end
+
+	if not currentTarget then return end
+
+	path:Run(currentTarget.Position)
+
+	if (root.Position - currentTarget.Position).Magnitude >= 6 then return end
+
+	currentTarget = FlowersService:RandomPathPoint()
+
+	if currentTarget then
+		path:Run(currentTarget.Position)
+	end
+end
+
+local function updateAI()
+	local player, distance = FlowersService:GetNearestPlayer(root)
+
+	if player and distance < FlowersService.Settings.ChaseDistance then
+		enterChase()
+		updateChase(player)
+		return
+	end
+
+	enterWander()
+	updateWander()
+end
+
+
+
+local function runAI()
+	while aiRunning do
+		task.wait(0.25)
+		updateAI()
+	end
+end
+
 -- Initializes the NPC and owns its main AI lifecycle. The outer loop watches the
 -- day/night cycle, while the inner loop performs lower-frequency AI decisions only
 -- while Flowers is active at night.
 function FlowersService:KnitStart()
-	flowers = ReplicatedStorage:WaitForChild("Flowers")
-	root = flowers and flowers.PrimaryPart
-	path = flowers and SimplePath.new(flowers)
-	Humanoid = flowers and flowers:FindFirstChild("Humanoid")
-	PunchAnimation = Util.LoadAnimation(Humanoid, "119528894450443", Enum.AnimationPriority.Action)
-	GrabAnimation = Util.LoadAnimation(Humanoid, "72069414099158", Enum.AnimationPriority.Action2)
-	StunnedAnimation = Util.LoadAnimation(Humanoid, "86989799335770", Enum.AnimationPriority.Action4)
-	setupSpeedFolder()
-	Humanoid.WalkSpeed = FlowersService.Settings.BaseWalkSpeed
+	initializeFlowers()
 
 	local TimeCycle = Knit.GetService("TimeCycle")
-	local aiRunning = false
 
-	-- Reaching a wander point immediately selects another point so roaming can
-	-- continue without waiting for the main decision loop to notice completion.
-	path.Reached:Connect(function()
-		if CurrentState == "WANDER" then
-			currentTarget = FlowersService:RandomPathPoint()
-			if currentTarget then
-				path:Run(currentTarget.Position)
-			end
-		end
-	end)
+	path.Reached:Connect(onPathReached)
 
 	task.spawn(function()
 		while true do
 			task.wait(0.1)
+
 			local cycle = TimeCycle.Client:GetCycle()
 
 			if cycle == "Night" and not aiRunning then
-				aiRunning = true
-				flowers.Parent = workspace
-				path.Visualize = Debug
+				startAI()
+				continue
+			end
 
-				-- AI decisions run at a lower frequency than the day/night watcher. This is
-				-- sufficient for target/state decisions without recomputing them every frame.
-				task.spawn(function()
-					while aiRunning do
-						task.wait(0.25)
-
-						local player, distance = FlowersService:GetNearestPlayer(root)
-
-						-- Enter chase when a player is inside the configured aggro range. Speed
-						-- changes are only applied on state transitions rather than every update.
-						if player and distance < FlowersService.Settings.ChaseDistance then
-							if CurrentState ~= "CHASE" then
-								lastTargetPosition = nil
-								self:AddMultiplier("Chase", FlowersService.Settings.ChaseMultiplier, nil, 0.5)
-							end
-							CurrentState = "CHASE"
-						else
-							if CurrentState == "CHASE" then
-								self:RemoveMultiplier("Chase", 0.5)
-							end
-							CurrentState = "WANDER"
-							lastTargetPosition = nil
-						end
-
-						if CurrentState == "CHASE" then
-							local character = player and player.Character
-							local hrp = character and character:FindFirstChild("HumanoidRootPart")
-							if hrp then
-								-- Pathfinding is only requested again after enough target movement to
-								-- justify a new destination, reducing unnecessary path computations.
-								if not lastTargetPosition or (hrp.Position - lastTargetPosition).Magnitude > RECOMPUTE_DISTANCE then
-									lastTargetPosition = hrp.Position
-									path:Run(hrp.Position)
-								end
-								FlowersService:TryAttack()
-							end
-							currentTarget = nil
-						elseif CurrentState == "WANDER" then
-							if not currentTarget then
-								currentTarget = FlowersService:RandomPathPoint()
-								if currentTarget then
-									path:Run(currentTarget.Position)
-								end
-							end
-
-							-- The distance check is a fallback for cases where the path library's
-							-- reached event is not enough to advance roaming on its own.
-							if currentTarget then
-								local dist = (root.Position - currentTarget.Position).Magnitude
-								if dist < 6 then
-									currentTarget = FlowersService:RandomPathPoint()
-									path:Run(currentTarget.Position)
-								end
-							end
-						end
-					end
-				end)
-
-			elseif cycle == "Day" and aiRunning then
-				-- Deactivating the NPC resets transient chase state before moving the model
-				-- back into ReplicatedStorage, ready for the next night cycle.
-				aiRunning = false
-				flowers.Parent = ReplicatedStorage
-				currentTarget = nil
-				CurrentState = "WANDER"
-				self:RemoveMultiplier("Chase")
-				path:Stop()
+			if cycle == "Day" and aiRunning then
+				stopAI()
 			end
 		end
 	end)
