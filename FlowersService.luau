@@ -321,22 +321,41 @@ function FlowersService:TryAttack()
 end
 
 
+-- Tracks whether the main Flowers AI loop should currently be running.
+-- Flowers only becomes active during the night.
+local aiRunning = false
+
+-- Switches Flowers into its chase state.
+-- This only runs the transition logic once instead of reapplying
+-- the chase multiplier every AI update.
 local function enterChase()
 	if CurrentState == "CHASE" then return end
 
 	CurrentState = "CHASE"
 	lastTargetPosition = nil
-	FlowersService:AddMultiplier("Chase", FlowersService.Settings.ChaseMultiplier, nil, 0.5)
+
+	FlowersService:AddMultiplier(
+		"Chase",
+		FlowersService.Settings.ChaseMultiplier,
+		nil,
+		0.5
+	)
 end
 
+-- Switches Flowers back into wandering.
+-- Removes the chase speed bonus and clears the last chase destination.
 local function enterWander()
 	if CurrentState == "WANDER" then return end
 
 	CurrentState = "WANDER"
 	lastTargetPosition = nil
+
 	FlowersService:RemoveMultiplier("Chase", 0.5)
 end
 
+-- Updates Flowers while chasing a player.
+-- Paths are only recomputed when the target has moved far enough,
+-- preventing unnecessary pathfinding requests every AI update.
 local function updateChase(player: Player?)
 	if not player then return end
 
@@ -348,7 +367,10 @@ local function updateChase(player: Player?)
 
 	currentTarget = nil
 
-	if not lastTargetPosition or (targetRoot.Position - lastTargetPosition).Magnitude > RECOMPUTE_DISTANCE then
+	local ShouldRecompute = not lastTargetPosition
+		or (targetRoot.Position - lastTargetPosition).Magnitude > RECOMPUTE_DISTANCE
+
+	if ShouldRecompute then
 		lastTargetPosition = targetRoot.Position
 		path:Run(targetRoot.Position)
 	end
@@ -356,24 +378,32 @@ local function updateChase(player: Player?)
 	FlowersService:TryAttack()
 end
 
+-- Updates Flowers while wandering around the map.
+-- A new path point is only selected when Flowers has no target
+-- or reaches the current wander point.
 local function updateWander()
 	if not currentTarget then
 		currentTarget = FlowersService:RandomPathPoint()
+
+		if currentTarget then
+			path:Run(currentTarget.Position)
+		end
+
+		return
 	end
 
+	local Distance = (root.Position - currentTarget.Position).Magnitude
+	if Distance >= 6 then return end
+
+	currentTarget = FlowersService:RandomPathPoint()
 	if not currentTarget then return end
 
 	path:Run(currentTarget.Position)
-
-	if (root.Position - currentTarget.Position).Magnitude >= 6 then return end
-
-	currentTarget = FlowersService:RandomPathPoint()
-
-	if currentTarget then
-		path:Run(currentTarget.Position)
-	end
 end
 
+-- Makes the high-level AI decision for this update.
+-- Chase takes priority whenever a player is inside the aggro range;
+-- otherwise Flowers returns to wandering.
 local function updateAI()
 	local player, distance = FlowersService:GetNearestPlayer(root)
 
@@ -387,13 +417,100 @@ local function updateAI()
 	updateWander()
 end
 
-
-
+-- Main AI update loop.
+-- Runs at a lower frequency because target selection and pathfinding
+-- do not need to run every frame.
 local function runAI()
 	while aiRunning do
 		task.wait(0.25)
 		updateAI()
 	end
+end
+
+-- Initializes all runtime references used by Flowers.
+-- Keeping this outside KnitStart prevents initialization from cluttering
+-- the actual service startup logic.
+local function initializeFlowers()
+	flowers = ReplicatedStorage:WaitForChild("Flowers")
+	root = flowers.PrimaryPart
+	path = SimplePath.new(flowers)
+	Humanoid = flowers:FindFirstChild("Humanoid")
+
+	PunchAnimation = Util.LoadAnimation(Humanoid, "119528894450443", Enum.AnimationPriority.Action)
+	GrabAnimation = Util.LoadAnimation(Humanoid, "72069414099158", Enum.AnimationPriority.Action2)
+	StunnedAnimation = Util.LoadAnimation(Humanoid, "86989799335770", Enum.AnimationPriority.Action4)
+
+	setupSpeedFolder()
+
+	Humanoid.WalkSpeed = FlowersService.Settings.BaseWalkSpeed
+end
+
+-- Called whenever Flowers reaches its current path destination.
+-- When wandering, reaching a destination immediately selects another
+-- point so Flowers continuously moves around the map.
+local function onPathReached()
+	if CurrentState ~= "WANDER" then return end
+
+	currentTarget = FlowersService:RandomPathPoint()
+	if not currentTarget then return end
+
+	path:Run(currentTarget.Position)
+end
+
+-- Activates Flowers when night begins and starts its AI loop.
+local function startAI()
+	if aiRunning then return end
+
+	aiRunning = true
+
+	flowers.Parent = workspace
+	path.Visualize = Debug
+
+	task.spawn(runAI)
+end
+
+-- Deactivates Flowers during the day and resets any temporary
+-- navigation/chase state so the next night begins cleanly.
+local function stopAI()
+	if not aiRunning then return end
+
+	aiRunning = false
+	currentTarget = nil
+	CurrentState = "WANDER"
+	lastTargetPosition = nil
+
+	FlowersService:RemoveMultiplier("Chase")
+	path:Stop()
+
+	flowers.Parent = ReplicatedStorage
+end
+
+-- Starts the Flowers NPC system.
+-- KnitStart now only handles initialization, event connections,
+-- and deciding when the AI should start/stop.
+function FlowersService:KnitStart()
+	initializeFlowers()
+
+	local TimeCycle = Knit.GetService("TimeCycle")
+
+	path.Reached:Connect(onPathReached)
+
+	task.spawn(function()
+		while true do
+			task.wait(0.1)
+
+			local Cycle = TimeCycle.Client:GetCycle()
+
+			if Cycle == "Night" and not aiRunning then
+				startAI()
+				continue
+			end
+
+			if Cycle == "Day" and aiRunning then
+				stopAI()
+			end
+		end
+	end)
 end
 
 -- Initializes the NPC and owns its main AI lifecycle. The outer loop watches the
