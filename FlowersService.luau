@@ -30,6 +30,7 @@ FlowersService.Settings = {
 -- Runtime state for the single Flowers NPC managed by this service. These
 -- references are initialized in KnitStart and reused by the AI and attack logic.
 local Debug = false
+local aiRunning = false
 local CurrentState = "WANDER"
 local currentTarget = nil
 local flowers: Model = nil
